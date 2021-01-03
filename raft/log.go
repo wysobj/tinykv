@@ -14,7 +14,11 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"log"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -49,14 +53,31 @@ type RaftLog struct {
 	// (Used in 2C)
 	pendingSnapshot *pb.Snapshot
 
-	// Your Data Here (2A).
+	committedEntryPos uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-	// Your Code Here (2A).
-	return nil
+	raftLog := &RaftLog{
+		storage:           storage,
+		entries:           make([]pb.Entry, 1),
+		committedEntryPos: 1,
+	}
+
+	lastLogIndex, err := storage.LastIndex()
+	if err != nil {
+		log.Panicf("recover log term failed, err: %v", err)
+	}
+
+	raftLog.entries[0].Index = lastLogIndex
+	lastLogTerm, err := raftLog.Term(lastLogIndex)
+	if err != nil {
+		log.Panicf("recover log term failed, index: %d, err: %v", lastLogIndex, err)
+	}
+	raftLog.entries[0].Term = lastLogTerm
+
+	return raftLog
 }
 
 // We need to compact the log entries in some point of time like
@@ -68,24 +89,104 @@ func (l *RaftLog) maybeCompact() {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	lastIdx, err := l.storage.LastIndex()
+	if err != nil {
+		return nil
+	}
+
+	if l.entries == nil {
+		return nil
+	}
+
+	entryLen := uint64(len(l.entries))
+	if entryLen == 0 {
+		return l.entries
+	}
+
+	firstIdx := l.entries[0].Index
+	if firstIdx > lastIdx {
+		return l.entries
+	}
+
+	unstableEntries := make([]pb.Entry, 1)
+	for offset := lastIdx - firstIdx + 1; offset < entryLen; offset++ {
+		unstableEntries = append(unstableEntries, l.entries[offset])
+	}
+	return unstableEntries
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
+	entryLen := uint64(len(l.entries))
+	if entryLen == 0 {
+		return nil
+	}
+
+	if l.committed == l.applied {
+		return nil
+	}
+
+	firstIdx := l.entries[0].Index
+	nextEnts := make([]pb.Entry, 1)
+	for i := l.applied + 1; i <= l.committed; i++ {
+		nextEnts = append(nextEnts, l.entries[i-firstIdx])
+	}
 	return nil
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	// Your Code Here (2A).
-	return 0
+	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	return l.storage.Term(i)
+}
+
+func (l *RaftLog) LastLogTerm() uint64 {
+	return l.entries[len(l.entries)-1].Term
+}
+
+// leader append operation, will assign indexes
+func (l *RaftLog) appendEntriesAndSetIndex(entries []*pb.Entry) {
+	nextIndex := l.LastIndex() + 1
+	for _, entry := range entries {
+		entry.Index = nextIndex
+		nextIndex++
+		l.entries = append(l.entries, *entry)
+	}
+}
+
+func (l *RaftLog) appendEntries(entries []*pb.Entry) {
+	if entries == nil || len(entries) == 0 {
+		return
+	}
+
+	firstIdx := entries[0].Index
+	lastIdx := firstIdx + uint64(len(entries)) - 1
+	firstLogIdx := l.entries[0].Index
+	lastLogIdx := l.LastIndex()
+
+	if lastIdx <= firstIdx {
+		return
+	}
+
+	if firstIdx <= firstLogIdx {
+		entries = entries[firstLogIdx-firstIdx+1:]
+	}
+
+	firstIdx = entries[0].Index
+	if firstIdx > lastLogIdx+1 {
+		log.Panicf("missing entries, lastIdx: %d, appendIdx: %d", l.LastIndex(), firstIdx)
+	}
+
+	for _, entry := range entries {
+		if entry.Index <= lastLogIdx {
+			offset := entry.Index - firstLogIdx
+			l.entries[offset] = *entry
+		} else {
+			l.entries = append(l.entries, *entry)
+		}
+	}
 }
